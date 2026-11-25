@@ -1,0 +1,37 @@
+{
+  "protocol": {
+    "_comment": "PLACEHOLDER frame layout: [report_id_out][opcode][payload...]. Edit to match the real spec.",
+    "report_id_in": "0x01",
+    "report_id_out": "0x02",
+    "report_id_notify": "0x03",
+    "report_size": 64,
+    "opcodes": [
+      {
+        "name": "SET_PROPERTY",
+        "code": "0x01"
+      },
+      {
+        "name": "GET_PROPERTY",
+        "code": "0x02"
+      },
+      {
+        "name": "NOTIFICATION",
+        "code": "0x03"
+      }
+    ]
+  },
+  "commands": [
+    {
+      "group": "Link test",
+      "name": "Echo short (4 B)",
+      "hex": "02 AA BB CC DD",
+      "note": "Short echo, padded with zeros up to the report size"
+    },
+    {
+      "group": "Protocol (placeholder)",
+      "name": "Get property 0x0001",
+      "hex": "02 02 01 00",
+      "note": "PLACEHOLDER - GET_PROPERTY, property id 0x0001"
+    }
+  ]
+}
