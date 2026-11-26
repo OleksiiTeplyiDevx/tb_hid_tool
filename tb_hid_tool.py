@@ -54,6 +54,8 @@ FW_STREAM_ID = 1
 FW_FRAME_COMMAND = 0
 FW_FRAME_RESPONSE = 1
 FW_FRAME_STREAM = 2
+OP_GET_PROPERTY = 0x02          # payload: property id u16 MSB first; response: status, value
+PROP_FW_VERSION = 0x0001        # placeholder id, value = ASCII version string
 FW_OP_START = 0x10              # payload: image_size u32 LE, crc32 u32 LE
 FW_OP_STREAM_ACK = 0x11         # device -> host: stream_id, status (0 OK, 1 ERROR), block index u16 MSB first
 FW_OP_VERIFY = 0x12
@@ -104,8 +106,8 @@ DEFAULT_CONFIG = {
          "note": "Firmware loopback: OUT 0x02 -> IN 0x01 with the same payload"},
         {"group": "Link test", "name": "Echo short (4 B)", "hex": "02 AA BB CC DD",
          "note": "Short echo, padded with zeros up to the report size"},
-        {"group": "Protocol (placeholder)", "name": "Get property 0x0001", "hex": "02 02 01 00",
-         "note": "PLACEHOLDER - GET_PROPERTY, property id 0x0001"},
+        {"group": "Protocol (placeholder)", "name": "Get FW version", "hex": "02 00 14 00 02 00 02 00 01", "action": "fw_version",
+         "note": "GET_PROPERTY, property 0x0001 = FW version, destination master. The answer is shown above the tabs"},
         {"group": "Protocol (placeholder)", "name": "Set property 0x0001 = 1", "hex": "02 01 01 00 01",
          "note": "PLACEHOLDER - SET_PROPERTY, property id 0x0001, value 1"},
     ],
@@ -409,6 +411,7 @@ class App:
         labels = [h["label"] for h in self.link.handles]
         pref = next((l for l in labels if "0x0001" in l), labels[0])
         self.log("INFO", "%sConnected if%s '%s'" % ("Re" if auto else "", sel["iface"], sel["product"]))
+        self.request_fw_version()
         return True
 
     def cb_connect(self, *_):
@@ -575,6 +578,9 @@ class App:
     def cb_cmd_send(self, sender, app_data, user_data):
         self.cb_cmd_pick(sender, app_data, user_data)
         c = self.cfg["commands"][user_data]
+        if c.get("action") == "fw_version":
+            self.request_fw_version()
+            return
         try:
             self.send_bytes(parse_hex(c.get("hex", "")), c["name"])
         except ValueError as exc:
@@ -622,6 +628,44 @@ class App:
 
     def fw_frame_stream(self, packet_seq, data):
         return bytes([(FW_FRAME_STREAM << 5) | FW_STREAM_ID, FW_DEST_MASTER, packet_seq & 0xFF]) + data
+
+    def request_fw_version(self):
+        """GET_PROPERTY(FW version). The answer is handled in on_rx."""
+        if not self.link.connected:
+            self.log("ERR", "Not connected")
+            return
+        dpg.set_value("fw_version", "Device FW version: reading...")
+        self.version_seq = self.fw_ctrl_seq & 0x0F
+        self.fw_ctrl_seq = (self.fw_ctrl_seq + 1) & 0x0F
+        payload = PROP_FW_VERSION.to_bytes(2, "big")
+        frame = bytes([FW_FRAME_COMMAND << 5, (self.version_seq << 4) | (FW_DEST_MASTER << 2), 0, OP_GET_PROPERTY,
+                       0, len(payload)]) + payload
+        self.version_pending = True
+        try:
+            self.fw_write(frame)
+            self.log("TX", "GET FW version  " + " ".join("%02X" % b for b in frame))
+        except OSError as exc:
+            self.version_pending = False
+            self.log("ERR", "GET FW version failed: %s" % exc)
+
+    def fw_on_version_response(self, data, ts):
+        """Returns True when the report is the answer to GET FW version."""
+        if not getattr(self, "version_pending", False) or len(data) < 8:
+            return False
+        frame = data[1:]
+        if (frame[0] >> 5) != FW_FRAME_RESPONSE or frame[3] != OP_GET_PROPERTY:
+            return False
+        self.version_pending = False
+        length = ((frame[4] & 0x0F) << 8) | frame[5]
+        status = frame[6] if length >= 1 else 0xFF
+        if status != 0:
+            self.log("ERR", "GET FW version: device status %d" % status, ts=ts)
+            dpg.set_value("fw_version", "Device FW version: unknown (status %d)" % status)
+            return True
+        version = bytes(frame[7:6 + length]).decode("ascii", errors="replace")
+        self.log("OK", "Device FW version: %s" % version, ts=ts)
+        dpg.set_value("fw_version", "Device FW version: %s" % version)
+        return True
 
     def fw_write(self, frame):
         """One HID report: report ID + frame, zero padded to the report size. Raises OSError."""
@@ -869,6 +913,8 @@ class App:
         except IndexError:
             return
         self.link.rx_count += 1
+        if self.fw_on_version_response(data, ts):
+            return
         if self.fw_on_rx(data, ts):
             return
         p = self.cfg["protocol"]
@@ -1002,6 +1048,7 @@ class App:
                 # -------- right: status, send, log
                 with dpg.child_window(width=-1, border=False):
                     dpg.add_text("Not connected", tag="status")
+                    dpg.add_text("Device FW version: -", tag="fw_version", color=C_NOTIFY)
                     with dpg.child_window(tag="send_panel", height=270, border=True):
                         with dpg.group(horizontal=True):
                             dpg.add_checkbox(label="Pad with zeros to", tag="pad_on", default_value=True)
@@ -1051,6 +1098,7 @@ class App:
                                     dpg.add_button(label="Browse...", width=100,
                                                    callback=lambda *_: dpg.show_item("fw_file_dialog"))
                                 dpg.add_text("No file selected", tag="fw_info", color=C_INFO)
+                                dpg.add_button(label="Read FW version", width=150, callback=lambda *_: self.request_fw_version())
                                 with dpg.group(horizontal=True):
                                     fw_start = dpg.add_button(label="Start update", width=130, callback=self.cb_fw_start)
                                     dpg.bind_item_theme(fw_start, green)

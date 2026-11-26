@@ -29,9 +29,10 @@
     },
     {
       "group": "Protocol (placeholder)",
-      "name": "Get property 0x0001",
-      "hex": "02 02 01 00",
-      "note": "PLACEHOLDER - GET_PROPERTY, property id 0x0001"
+      "name": "Get FW version",
+      "hex": "02 00 14 00 02 00 02 00 01",
+      "note": "GET_PROPERTY, property 0x0001 = FW version, destination master. The answer is shown above the tabs",
+      "action": "fw_version"
     }
   ]
 }
