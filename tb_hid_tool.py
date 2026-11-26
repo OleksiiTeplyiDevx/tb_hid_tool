@@ -21,6 +21,7 @@ import re
 import sys
 import threading
 import time
+import zlib
 
 try:
     import hid
@@ -43,6 +44,34 @@ TB_VID = 0x10F5  # Turtle Beach
 MAX_READ = 128
 MAX_LOG_ITEMS = 1500
 REFRESH_PERIOD_S = 1.5
+
+# Firmware update protocol (matches tb_fwupd_protocol_parser.c in the firmware)
+FW_REPORT_SIZE = 64             # HID report incl. the report ID byte
+FW_BLOCK_SIZE = 4096            # one block = one flash sector, one ACK
+FW_PACKET_DATA = 60             # stream packet = 3 byte header + 60 data bytes
+FW_DEST_MASTER = 1              # destination 1 = master, 2 = slave (not implemented in firmware yet)
+FW_STREAM_ID = 1
+FW_FRAME_COMMAND = 0
+FW_FRAME_RESPONSE = 1
+FW_FRAME_STREAM = 2
+FW_OP_START = 0x10              # payload: image_size u32 LE, crc32 u32 LE
+FW_OP_STREAM_ACK = 0x11         # device -> host: stream_id, status (0 OK, 1 ERROR), block index u16 MSB first
+FW_OP_VERIFY = 0x12
+FW_OP_APPLY = 0x13
+FW_OP_ABORT = 0x14
+FW_OP_NAMES = {FW_OP_START: "START", FW_OP_VERIFY: "VERIFY", FW_OP_APPLY: "APPLY", FW_OP_ABORT: "ABORT"}
+FW_ERROR_NAMES = {
+    1: "command not allowed in the current state",
+    2: "bad parameter (or destination is not the master)",
+    3: "image does not fit in the FOTA partition",
+    4: "flash erase/write/read failed",
+    5: "image CRC32 mismatch",
+    6: "image is not complete",
+    7: "cannot trigger the update",
+}
+FW_RESPONSE_TIMEOUT_S = 3.0
+FW_ACK_TIMEOUT_S = 5.0          # includes flash erase + write of one block
+FW_VERIFY_TIMEOUT_S = 30.0      # the device reads the whole image back from flash
 
 # Colours
 C_TX = (120, 220, 140)
@@ -263,6 +292,9 @@ class App:
         self.echo = None           # dict(expect=bytes, deadline=float)
         self.next_refresh = 0.0
         self.next_repeat = 0.0
+        self.fw = None             # running firmware update (dict) or None
+        self.fw_image = None       # loaded file (dict) or None
+        self.fw_ctrl_seq = 0
 
     # ------------------------------------------------------------------ logging
     def log(self, kind, text, extra=None, ts=None):
@@ -376,9 +408,7 @@ class App:
         self.reconnect_key = (sel["vid"], sel["pid"], sel["iface"], sel["usage_page"], sel["usage"], open_all)
         labels = [h["label"] for h in self.link.handles]
         pref = next((l for l in labels if "0x0001" in l), labels[0])
-        self.log("INFO", "%sConnected %04X:%04X if%s '%s' - %d collection(s): %s" % (
-            "Re" if auto else "", sel["vid"], sel["pid"], sel["iface"], sel["product"],
-            len(infos), ", ".join(labels)))
+        self.log("INFO", "%sConnected if%s '%s'" % ("Re" if auto else "", sel["iface"], sel["product"]))
         return True
 
     def cb_connect(self, *_):
@@ -582,6 +612,255 @@ class App:
         self.rebuild_commands()
         self.log("INFO", "Command '%s' deleted" % c["name"])
 
+    # ------------------------------------------------------------------ firmware update
+    def fw_frame_control(self, opcode, payload=b""):
+        seq = self.fw_ctrl_seq & 0x0F
+        self.fw_ctrl_seq = (self.fw_ctrl_seq + 1) & 0x0F
+        header = bytes([FW_FRAME_COMMAND << 5, (seq << 4) | (FW_DEST_MASTER << 2), 0, opcode,
+                        (len(payload) >> 8) & 0x0F, len(payload) & 0xFF])
+        return header + payload
+
+    def fw_frame_stream(self, packet_seq, data):
+        return bytes([(FW_FRAME_STREAM << 5) | FW_STREAM_ID, FW_DEST_MASTER, packet_seq & 0xFF]) + data
+
+    def fw_write(self, frame):
+        """One HID report: report ID + frame, zero padded to the report size. Raises OSError."""
+        rid = to_int(self.cfg["protocol"].get("report_id_out", "0x02"), 2)
+        report = bytes([rid]) + frame
+        report += bytes(max(0, FW_REPORT_SIZE - len(report)))
+        order = list(range(len(self.link.handles)))
+        pref = getattr(self, "write_idx", 0)
+        if pref in order:
+            order.remove(pref)
+            order.insert(0, pref)
+        last_exc = None
+        for i in order:
+            try:
+                self.link.write(i, report)
+                self.write_idx = i
+                return
+            except (OSError, ValueError) as exc:
+                last_exc = exc
+        raise OSError(str(last_exc))
+
+    def fw_send_control(self, opcode, payload=b"", note=""):
+        frame = self.fw_frame_control(opcode, payload)
+        self.fw_write(frame)
+        self.log("TX", "FW %s  %s%s" % (FW_OP_NAMES.get(opcode, "0x%02X" % opcode),
+                                       " ".join("%02X" % b for b in frame), ("  " + note) if note else ""))
+
+    def fw_set_status(self, text, color=C_INFO):
+        dpg.set_value("fw_status", text)
+        dpg.configure_item("fw_status", color=color)
+
+    def fw_elapsed(self):
+        """Seconds since the update started (frozen after it ends)."""
+        if self.fw:
+            return time.time() - self.fw["t0"]
+        return getattr(self, "fw_last_elapsed", 0.0)
+
+    def fw_set_progress(self, done, total, label=None):
+        self.fw_progress_state = (done, total, label)
+        dpg.set_value("fw_progress", (done / total) if total else 0.0)
+        text = label or ("%d / %d blocks" % (done, total))
+        dpg.configure_item("fw_progress", overlay="%s   |   %.1f s" % (text, self.fw_elapsed()))
+
+    def fw_refresh_progress(self):
+        state = getattr(self, "fw_progress_state", None)
+        if state:
+            self.fw_set_progress(*state)
+
+    def fw_load_file(self, path):
+        """Read the file and show its size, block count and CRC32. Returns True when ready."""
+        self.fw_image = None
+        path = (path or "").strip().strip('"')
+        if not path:
+            dpg.set_value("fw_info", "No file selected")
+            return False
+        try:
+            with open(path, "rb") as f:
+                data = f.read()
+        except OSError as exc:
+            dpg.set_value("fw_info", "Cannot read file: %s" % exc)
+            return False
+        if not data:
+            dpg.set_value("fw_info", "File is empty")
+            return False
+        crc = zlib.crc32(data) & 0xFFFFFFFF
+        blocks = (len(data) + FW_BLOCK_SIZE - 1) // FW_BLOCK_SIZE
+        self.fw_image = {"path": path, "data": data, "crc": crc, "blocks": blocks}
+        dpg.set_value("fw_info", "%s   |   %d bytes   |   %d blocks of %d   |   CRC32 0x%08X" % (
+            os.path.basename(path), len(data), blocks, FW_BLOCK_SIZE, crc))
+        return True
+
+    def fw_set_default_file(self):
+        guess = os.path.normpath(os.path.join(APP_DIR, "..", "master", "fota_package.bin"))
+        if os.path.exists(guess):
+            dpg.set_value("fw_path", guess)
+            self.fw_load_file(guess)
+
+    def cb_fw_path(self, *_):
+        self.fw_load_file(dpg.get_value("fw_path"))
+
+    def cb_fw_file_picked(self, sender, app_data):
+        picked = app_data.get("file_path_name", "")
+        if picked and not picked.endswith(".*"):
+            dpg.set_value("fw_path", picked)
+            self.fw_load_file(picked)
+
+    def cb_fw_start(self, *_):
+        if self.fw:
+            self.log("ERR", "FW update is already running")
+            return
+        if not self.link.connected:
+            self.log("ERR", "Not connected")
+            return
+        if not self.fw_load_file(dpg.get_value("fw_path")):   # re-read: the build may have changed the file
+            self.log("ERR", "FW update: choose a valid file first")
+            return
+        image = self.fw_image
+        self.fw = {"state": "start", "wait_opcode": FW_OP_START, "block": 0, "blocks": image["blocks"],
+                   "data": image["data"], "crc": image["crc"], "t0": time.time(),
+                   "deadline": time.time() + FW_RESPONSE_TIMEOUT_S}
+        self.fw_ctrl_seq = 0
+        self.log("INFO", "FW update: %s, %d bytes, %d blocks, CRC32 0x%08X, destination master" % (
+            os.path.basename(image["path"]), len(image["data"]), image["blocks"], image["crc"]))
+        self.fw_set_progress(0, image["blocks"], "Starting...")
+        self.fw_set_status("Update running", C_NOTIFY)
+        payload = len(image["data"]).to_bytes(4, "little") + image["crc"].to_bytes(4, "little")
+        try:
+            self.fw_send_control(FW_OP_START, payload, "size=%d crc=0x%08X" % (len(image["data"]), image["crc"]))
+        except OSError as exc:
+            self.fw_fail("write failed: %s" % exc, send_abort=False)
+
+    def cb_fw_abort(self, *_):
+        if not self.fw:
+            return
+        self.fw_fail("aborted by user")
+
+    def fw_fail(self, reason, send_abort=True):
+        self.log("ERR", "FW update FAILED: %s" % reason)
+        if self.fw and self.fw["block"] < self.fw["blocks"]:
+            self.fw_set_progress(self.fw["block"], self.fw["blocks"],
+                                 "FAILED at block %d / %d" % (self.fw["block"] + 1, self.fw["blocks"]))
+        self.fw_set_status("FAILED: %s" % reason, C_ERR)
+        if self.fw:
+            self.fw_last_elapsed = time.time() - self.fw["t0"]
+        self.fw = None
+        if send_abort and self.link.connected:
+            try:
+                self.fw_send_control(FW_OP_ABORT)
+            except OSError:
+                pass
+
+    def fw_send_block(self):
+        fw = self.fw
+        index = fw["block"]
+        block = fw["data"][index * FW_BLOCK_SIZE:(index + 1) * FW_BLOCK_SIZE]
+        packets = 0
+        try:
+            for offset in range(0, len(block), FW_PACKET_DATA):
+                self.fw_write(self.fw_frame_stream(packets, block[offset:offset + FW_PACKET_DATA]))
+                packets += 1
+        except OSError as exc:
+            self.fw_fail("write failed in block %d: %s" % (index + 1, exc), send_abort=False)
+            return
+        self.log("TX", "FW block %d / %d: %d bytes in %d packets, waiting for ACK" % (
+            index + 1, fw["blocks"], len(block), packets))
+        fw["state"] = "ack"
+        fw["deadline"] = time.time() + FW_ACK_TIMEOUT_S
+
+    def fw_on_rx(self, data, ts):
+        """Returns True when the report was a firmware update frame (then it is not dumped as hex)."""
+        if not self.fw or len(data) < 7:
+            return False
+        frame = data[1:]                                   # data[0] = report ID
+        frame_type = frame[0] >> 5
+        opcode = frame[3]
+        if frame_type == FW_FRAME_RESPONSE and opcode in FW_OP_NAMES:
+            is_error = bool(frame[0] & 0x08)
+            error_code = frame[6] if is_error and len(frame) > 6 else 0
+            self.fw_on_response(opcode, is_error, error_code, ts)
+            return True
+        if frame_type == FW_FRAME_COMMAND and opcode == FW_OP_STREAM_ACK and len(frame) >= 10:
+            self.fw_on_stream_ack(frame[7], (frame[8] << 8) | frame[9], ts)
+            return True
+        return False
+
+    def fw_on_response(self, opcode, is_error, error_code, ts):
+        fw = self.fw
+        name = FW_OP_NAMES[opcode]
+        if opcode != fw["wait_opcode"]:
+            self.log("INFO", "FW: unexpected %s response ignored" % name, ts=ts)
+            return
+        if is_error:
+            self.log("RX", "FW %s response: ERROR %d" % (name, error_code), ts=ts)
+            self.fw_fail("%s refused by the device: %s" % (name, FW_ERROR_NAMES.get(error_code, "error %d" % error_code)),
+                         send_abort=False)
+            return
+        self.log("RX", "FW %s response: OK" % name, ts=ts)
+        if opcode == FW_OP_START:
+            fw["state"] = "send"
+        elif opcode == FW_OP_VERIFY:
+            self.log("OK", "Device verified the image CRC32 in flash")
+            fw["wait_opcode"] = FW_OP_APPLY
+            fw["state"] = "apply"
+            fw["deadline"] = time.time() + FW_RESPONSE_TIMEOUT_S
+            self.fw_set_progress(fw["blocks"], fw["blocks"], "Applying...")
+            try:
+                self.fw_send_control(FW_OP_APPLY)
+            except OSError as exc:
+                self.fw_fail("write failed: %s" % exc, send_abort=False)
+        elif opcode == FW_OP_APPLY:
+            elapsed = max(time.time() - fw["t0"], 0.001)
+            self.fw_last_elapsed = elapsed
+            self.log("OK", "FW update done: %d bytes in %.1f s (%.1f KB/s). The device has set the update flag." % (
+                len(fw["data"]), elapsed, len(fw["data"]) / 1024.0 / elapsed))
+            self.fw = None
+            self.fw_set_progress(fw["blocks"], fw["blocks"], "Done")
+            self.fw_set_status("Done: the device accepted the update and resets", C_OK)
+
+    def fw_on_stream_ack(self, ack_status, block_index, ts):
+        fw = self.fw
+        if fw["state"] != "ack":
+            self.log("INFO", "FW: unexpected block ACK ignored (block %d)" % block_index, ts=ts)
+            return
+        if ack_status != 0:
+            self.log("RX", "FW block %d / %d: ACK ERROR (flash write failed)" % (block_index + 1, fw["blocks"]), ts=ts)
+            self.fw_fail("the device could not write block %d" % (block_index + 1), send_abort=False)
+            return
+        if block_index != fw["block"]:
+            self.fw_fail("ACK for block %d, expected %d" % (block_index, fw["block"]))
+            return
+        fw["block"] += 1
+        self.log("RX", "FW block %d / %d written (ACK OK)" % (fw["block"], fw["blocks"]), ts=ts)
+        self.fw_set_progress(fw["block"], fw["blocks"])
+        if fw["block"] < fw["blocks"]:
+            fw["state"] = "send"
+            return
+        fw["state"] = "verify"
+        fw["wait_opcode"] = FW_OP_VERIFY
+        fw["deadline"] = time.time() + FW_VERIFY_TIMEOUT_S
+        self.fw_set_progress(fw["blocks"], fw["blocks"], "Verifying...")
+        try:
+            self.fw_send_control(FW_OP_VERIFY)
+        except OSError as exc:
+            self.fw_fail("write failed: %s" % exc, send_abort=False)
+
+    def fw_tick(self):
+        fw = self.fw
+        if not fw:
+            return
+        if not self.link.connected:
+            self.fw_fail("device disconnected", send_abort=False)
+            return
+        if fw["state"] == "send":
+            self.fw_send_block()
+        elif time.time() > fw["deadline"]:
+            what = {"start": "the START response", "ack": "the ACK of block %d" % (fw["block"] + 1),
+                    "verify": "the VERIFY response", "apply": "the APPLY response"}.get(fw["state"], fw["state"])
+            self.fw_fail("timeout waiting for %s" % what)
+
     # ------------------------------------------------------------------ events
     def on_rx(self, ev):
         _, idx, data, ts = ev
@@ -590,6 +869,8 @@ class App:
         except IndexError:
             return
         self.link.rx_count += 1
+        if self.fw_on_rx(data, ts):
+            return
         p = self.cfg["protocol"]
         rid = data[0]
         notify = rid == to_int(p.get("report_id_notify", "0x03"), 3)
@@ -619,6 +900,9 @@ class App:
                 self.on_rx(ev)
             elif ev[0] == "lost":
                 self.on_lost(ev)
+        self.fw_tick()
+        if self.fw:
+            self.fw_refresh_progress()
         now = time.time()
         if self.echo and now > self.echo["deadline"]:
             self.log("ERR", "Echo test FAIL: no reply within 1 s")
@@ -690,6 +974,11 @@ class App:
         p = self.cfg["protocol"]
         op_names = [o["name"] for o in p.get("opcodes", [])] + ["(custom)"]
 
+        with dpg.file_dialog(directory_selector=False, show=False, callback=self.cb_fw_file_picked,
+                             tag="fw_file_dialog", width=720, height=420, modal=True):
+            dpg.add_file_extension(".bin", color=(120, 220, 140))
+            dpg.add_file_extension(".*")
+
         with dpg.window(tag="main"):
             with dpg.group(horizontal=True):
                 # -------- left: devices + commands
@@ -713,7 +1002,7 @@ class App:
                 # -------- right: status, send, log
                 with dpg.child_window(width=-1, border=False):
                     dpg.add_text("Not connected", tag="status")
-                    with dpg.child_window(tag="send_panel", height=226, border=True):
+                    with dpg.child_window(tag="send_panel", height=270, border=True):
                         with dpg.group(horizontal=True):
                             dpg.add_checkbox(label="Pad with zeros to", tag="pad_on", default_value=True)
                             dpg.add_input_int(tag="pad_size", default_value=int(p.get("report_size", 64)),
@@ -755,6 +1044,20 @@ class App:
                                     fs = dpg.add_button(label="Send frame", width=110, callback=self.cb_fb_send)
                                     dpg.bind_item_theme(fs, green)
                                     dpg.add_button(label="Copy to Raw hex", callback=self.cb_fb_to_raw)
+                            with dpg.tab(label="Firmware update"):
+                                with dpg.group(horizontal=True):
+                                    dpg.add_input_text(tag="fw_path", width=-110, hint="path to fota_package.bin",
+                                                       on_enter=True, callback=self.cb_fw_path)
+                                    dpg.add_button(label="Browse...", width=100,
+                                                   callback=lambda *_: dpg.show_item("fw_file_dialog"))
+                                dpg.add_text("No file selected", tag="fw_info", color=C_INFO)
+                                with dpg.group(horizontal=True):
+                                    fw_start = dpg.add_button(label="Start update", width=130, callback=self.cb_fw_start)
+                                    dpg.bind_item_theme(fw_start, green)
+                                    fw_abort = dpg.add_button(label="Abort", width=90, callback=self.cb_fw_abort)
+                                    dpg.bind_item_theme(fw_abort, red)
+                                dpg.add_progress_bar(tag="fw_progress", width=-1, height=26, overlay="Idle")
+                                dpg.add_text("", tag="fw_status", color=C_INFO)
                     hs = dpg.add_button(tag="hsplit", label="", width=-1, height=6)
                     dpg.bind_item_theme(hs, split_theme)
                     with dpg.group(horizontal=True):
@@ -770,6 +1073,7 @@ class App:
             dpg.bind_item_font("log_win", mono)
 
         self.rebuild_commands()
+        self.fw_set_default_file()
         self.cb_fb_changed()
         self.apply_lock(False, force=True)
         dpg.create_viewport(title=APP_TITLE, width=1240, height=780, min_width=980, min_height=600)
