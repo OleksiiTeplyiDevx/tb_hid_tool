@@ -54,6 +54,9 @@ FW_DEST_SLAVE = 2
 FW_DEST_NAMES = {FW_DEST_MASTER: "master", FW_DEST_SLAVE: "slave"}
 FW_DEST_BY_NAME = {name: dest for dest, name in FW_DEST_NAMES.items()}   # "master" -> 1, used by "dest" in tb_commands.json
 FW_STREAM_ID = 1
+RAW_DEST_BYTE = 2               # raw report: [report ID][type][seq | dest << 2]
+RAW_DEST_MASK = 0x0C
+RAW_DEST_SHIFT = 2
 FW_FRAME_COMMAND = 0
 FW_FRAME_RESPONSE = 1
 FW_FRAME_STREAM = 2
@@ -270,7 +273,6 @@ class App:
         self.log_text = []
         self.cmd_sel_ids = []
         self.cmd_selected = None
-        self.echo = None           # dict(expect=bytes, deadline=float)
         self.next_refresh = 0.0
         self.next_repeat = 0.0
         self.fw = None             # running firmware update (dict) or None
@@ -454,6 +456,32 @@ class App:
                  hexdump(data, dpg.get_value("trim")))
         return True
 
+    def cb_raw_dest(self, *_):
+        """Writes the chosen destination (bits 3:2 of the second frame byte) into the hex field."""
+        dest = FW_DEST_BY_NAME[dpg.get_value("raw_dest_sel").lower()]
+        try:
+            data = bytearray(parse_hex(dpg.get_value("hex_in")))
+        except ValueError:
+            return
+        if len(data) <= RAW_DEST_BYTE:
+            return
+        data[RAW_DEST_BYTE] = (data[RAW_DEST_BYTE] & ~RAW_DEST_MASK & 0xFF) | (dest << RAW_DEST_SHIFT)
+        dpg.set_value("hex_in", " ".join("%02X" % byte_value for byte_value in data))
+
+    def raw_dest_from_hex(self):
+        """Sets the destination radio from the hex field (when a command is loaded)."""
+        try:
+            data = parse_hex(dpg.get_value("hex_in"))
+        except ValueError:
+            return
+        if len(data) > RAW_DEST_BYTE:
+            dest = (data[RAW_DEST_BYTE] & RAW_DEST_MASK) >> RAW_DEST_SHIFT
+            if dest in FW_DEST_NAMES:
+                dpg.set_value("raw_dest_sel", FW_DEST_NAMES[dest].capitalize())
+
+    def cb_raw_clear(self, *_):
+        dpg.set_value("hex_in", "")
+
     def cb_send_raw(self, *_):
         try:
             data = parse_hex(dpg.get_value("hex_in"))
@@ -461,42 +489,6 @@ class App:
             self.log("ERR", "Hex error: %s" % exc)
             return
         self.send_bytes(data, "raw")
-
-    def cb_echo(self, *_):
-        rid = to_int(self.cfg["protocol"].get("report_id_out", "0x02"), 2)
-        size = max(to_int(dpg.get_value("pad_size"), 64), 2) if dpg.get_value("pad_on") else 64
-        data = bytes([rid]) + bytes((i % 255) + 1 for i in range(size - 1))
-        if self.send_bytes(data, "echo test"):
-            self.echo = {"expect": data[1:], "deadline": time.time() + 1.0}
-
-    # ------------------------------------------------------------------ frame builder
-    def build_frame(self):
-        protocol = self.cfg["protocol"]
-        rid = to_int(dpg.get_value("fb_rid"), 2)
-        name = dpg.get_value("fb_op")
-        code = next((to_int(opcode_entry["code"]) for opcode_entry in protocol.get("opcodes", []) if opcode_entry["name"] == name), None)
-        if code is None:
-            code = to_int(dpg.get_value("fb_op_custom"), 0)
-        payload = parse_hex(dpg.get_value("fb_payload"))
-        return bytes([rid, code]) + payload
-
-    def cb_fb_changed(self, *_):
-        try:
-            dpg.set_value("fb_preview", "Frame: " + " ".join("%02X" % byte_value for byte_value in self.build_frame()))
-        except ValueError as exc:
-            dpg.set_value("fb_preview", "Frame: (%s)" % exc)
-
-    def cb_fb_send(self, *_):
-        try:
-            self.send_bytes(self.build_frame(), "frame")
-        except ValueError as exc:
-            self.log("ERR", "Payload error: %s" % exc)
-
-    def cb_fb_to_raw(self, *_):
-        try:
-            dpg.set_value("hex_in", " ".join("%02X" % byte_value for byte_value in self.build_frame()))
-        except ValueError as exc:
-            self.log("ERR", "Payload error: %s" % exc)
 
     def drag_splitters(self):
         if dpg.is_item_active("vsplit"):
@@ -556,6 +548,7 @@ class App:
             dpg.set_value(sid, i == user_data)
         command = self.cfg["commands"][user_data]
         dpg.set_value("hex_in", command.get("hex", ""))
+        self.raw_dest_from_hex()
 
     def cb_cmd_send(self, sender, app_data, user_data):
         self.cb_cmd_pick(sender, app_data, user_data)
@@ -921,13 +914,6 @@ class App:
         kind = "NOTIFY" if notify else "RX"
         self.log(kind, "%s  id=0x%02X len=%d" % (label, rid, len(data)),
                  hexdump(data, dpg.get_value("trim")), ts=ts)
-        if self.echo and rid == to_int(protocol.get("report_id_in", "0x01"), 1):
-            echo_len = len(self.echo["expect"])
-            if data[1:1 + echo_len] == self.echo["expect"]:
-                self.log("OK", "Echo test PASS (%d bytes returned unchanged)" % echo_len)
-            else:
-                self.log("ERR", "Echo test FAIL: reply differs from what was sent")
-            self.echo = None
 
     def on_lost(self, ev):
         if self.link.connected:
@@ -950,9 +936,6 @@ class App:
         if self.fw:
             self.fw_refresh_progress()
         now = time.time()
-        if self.echo and now > self.echo["deadline"]:
-            self.log("ERR", "Echo test FAIL: no reply within 1 s")
-            self.echo = None
         if dpg.get_value("repeat_on") and self.link.connected and now >= self.next_repeat:
             self.next_repeat = now + max(to_int(dpg.get_value("repeat_ms"), 500), 10) / 1000.0
             self.cb_send_raw()
@@ -1018,7 +1001,6 @@ class App:
                 dpg.add_theme_color(dpg.mvThemeCol_ButtonActive, (90, 130, 190))
                 dpg.add_theme_style(dpg.mvStyleVar_FrameRounding, 2)
         protocol = self.cfg["protocol"]
-        op_names = [opcode_entry["name"] for opcode_entry in protocol.get("opcodes", [])] + ["(custom)"]
 
         with dpg.file_dialog(directory_selector=False, show=False, callback=self.cb_fw_file_picked,
                              tag="fw_file_dialog", width=720, height=420, modal=True):
@@ -1058,40 +1040,22 @@ class App:
                             dpg.add_text("bytes")
                         with dpg.tab_bar():
                             with dpg.tab(label="Raw hex"):
+                                with dpg.group(horizontal=True):
+                                    dpg.add_text("Target chip:")
+                                    dpg.add_radio_button(items=["Master", "Slave"], tag="raw_dest_sel", horizontal=True,
+                                                         default_value="Master", callback=self.cb_raw_dest)
                                 dpg.add_input_text(tag="hex_in", width=-1, hint="02 01 02 03 ...  (first byte = report ID)",
                                                    on_enter=True, callback=self.cb_send_raw)
                                 dpg.add_text("0 byte(s)", tag="hex_info", color=C_INFO)
                                 with dpg.group(horizontal=True):
                                     sb = dpg.add_button(label="Send", width=90, callback=self.cb_send_raw)
                                     dpg.bind_item_theme(sb, green)
-                                    eb = dpg.add_button(label="Echo test", callback=self.cb_echo)
-                                    dpg.bind_item_theme(eb, blue)
-                                    with dpg.tooltip(eb):
-                                        dpg.add_text("Sends OUT 0x02 + counter bytes and checks that the\n"
-                                                     "firmware returns the same payload as IN 0x01", wrap=380)
+                                    dpg.add_button(label="Clear", width=90, callback=self.cb_raw_clear)
+                                with dpg.group(horizontal=True):
                                     dpg.add_checkbox(label="Repeat every", tag="repeat_on")
                                     dpg.add_input_int(tag="repeat_ms", default_value=500, width=110, step=100,
                                                       min_value=10, min_clamped=True)
                                     dpg.add_text("ms")
-                            with dpg.tab(label="Frame builder"):
-                                dpg.add_text("PLACEHOLDER layout: report ID + opcode + payload "
-                                             "(edit opcodes in tb_commands.json)", color=C_NOTIFY)
-                                with dpg.group(horizontal=True):
-                                    dpg.add_text("Report ID")
-                                    dpg.add_input_text(tag="fb_rid", width=60, default_value=protocol.get("report_id_out", "0x02"),
-                                                       callback=self.cb_fb_changed)
-                                    dpg.add_text("Opcode")
-                                    dpg.add_combo(items=op_names, tag="fb_op", width=170, default_value=op_names[0],
-                                                  callback=self.cb_fb_changed)
-                                    dpg.add_input_text(tag="fb_op_custom", width=60, hint="0x..",
-                                                       callback=self.cb_fb_changed)
-                                dpg.add_input_text(tag="fb_payload", width=-1, hint="payload hex, e.g. 01 00 05",
-                                                   callback=self.cb_fb_changed)
-                                dpg.add_text("Frame:", tag="fb_preview", color=C_INFO)
-                                with dpg.group(horizontal=True):
-                                    fs = dpg.add_button(label="Send frame", width=110, callback=self.cb_fb_send)
-                                    dpg.bind_item_theme(fs, green)
-                                    dpg.add_button(label="Copy to Raw hex", callback=self.cb_fb_to_raw)
                             with dpg.tab(label="Firmware update"):
                                 with dpg.group(horizontal=True):
                                     dpg.add_text("Target chip:")
@@ -1126,7 +1090,6 @@ class App:
 
         self.rebuild_commands()
         self.fw_set_default_file()
-        self.cb_fb_changed()
         self.apply_lock(False, force=True)
         dpg.create_viewport(title=APP_TITLE, width=1240, height=780, min_width=980, min_height=600)
         dpg.setup_dearpygui()
@@ -1141,7 +1104,6 @@ class App:
         data = bytes([0x02] + list(range(1, 64)))
         self.log("TX", "Col01 (usage 0x0001)  id=0x02 len=64  [Echo 01..3F]", hexdump(data, True))
         self.log("RX", "Col01 (usage 0x0001)  id=0x01 len=64", hexdump(bytes([1]) + data[1:], True))
-        self.log("OK", "Echo test PASS (63 bytes returned unchanged)")
         self.log("NOTIFY", "Col02 (usage 0x0002)  id=0x03 len=64", hexdump(bytes([3, 0x10, 0x01, 0x55]) + bytes(60), True))
         self.log("ERR", "write failed via Col02 (usage 0x0002): example error")
 

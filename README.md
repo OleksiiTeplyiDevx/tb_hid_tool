@@ -27,8 +27,7 @@ or `run_tb_hid_tool.bat`. Option `--demo` fills the log with sample lines.
    `Device FW version: 1.31.276.0`. **Read FW version** (Firmware update tab) and the
    `Get FW version` default command repeat the request.
 3. Send frames from the tabs:
-   - **Raw hex** - first byte is the report ID, padded with zeros to the report size (64). Has an echo test and repeat.
-   - **Frame builder** - report ID + opcode + payload.
+   - **Raw hex** - first byte is the report ID, padded with zeros to the report size (64). Has repeat.
    - **Firmware update** - see below.
 4. The log shows TX / RX / NOTIFY with a hex dump.
 

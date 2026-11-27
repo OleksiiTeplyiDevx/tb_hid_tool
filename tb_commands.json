@@ -1,31 +1,22 @@
 {
   "protocol": {
-    "_comment": "PLACEHOLDER frame layout: [report_id_out][opcode][payload...]. Edit to match the real spec.",
     "report_id_in": "0x01",
     "report_id_out": "0x02",
     "report_id_notify": "0x03",
-    "report_size": 64,
-    "opcodes": [
-      {
-        "name": "SET_PROPERTY",
-        "code": "0x01"
-      },
-      {
-        "name": "GET_PROPERTY",
-        "code": "0x02"
-      },
-      {
-        "name": "NOTIFICATION",
-        "code": "0x03"
-      }
-    ]
+    "report_size": 64
   },
   "commands": [
     {
       "group": "Link test",
-      "name": "Echo short (4 B)",
-      "hex": "02 AA BB CC DD",
-      "note": "Short echo, padded with zeros up to the report size"
+      "name": "Ping master",
+      "hex": "02 00 04 00 04 00 04 DE AD BE EF",
+      "note": "PING (opcode 0x04), destination master. The answer repeats the payload"
+    },
+    {
+      "group": "Link test",
+      "name": "Ping slave",
+      "hex": "02 00 08 00 04 00 04 DE AD BE EF",
+      "note": "PING (opcode 0x04), destination slave: master -> co-sys -> slave. The answer repeats the payload"
     },
     {
       "group": "Protocol (placeholder)",
