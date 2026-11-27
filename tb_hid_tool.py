@@ -47,13 +47,14 @@ REFRESH_PERIOD_S = 1.5
 
 # Firmware update protocol (matches tb_fwupd_protocol_parser.c in the firmware)
 FW_REPORT_SIZE = 64             # HID report incl. the report ID byte
-FW_BLOCK_SIZE = 4096            # one block = one flash sector, one ACK
+FW_BLOCK_SIZE = 1024             # the device asks for blocks of this size and ACKs each one
 FW_PACKET_DATA = 60             # stream packet = 3 byte header + 60 data bytes
 FW_DEST_MASTER = 1              # destination 1 = master, 2 = slave
 FW_DEST_SLAVE = 2
 FW_DEST_NAMES = {FW_DEST_MASTER: "master", FW_DEST_SLAVE: "slave"}
 FW_DEST_BY_NAME = {name: dest for dest, name in FW_DEST_NAMES.items()}   # "master" -> 1, used by "dest" in tb_commands.json
 FW_STREAM_ID = 1
+FW_STREAM_FLAG_BLOCK_END = 0x80       # dest byte flag: last frame of a 1 KB block
 RAW_DEST_BYTE = 2               # raw report: [report ID][type][seq | dest << 2]
 RAW_DEST_MASK = 0x0C
 RAW_DEST_SHIFT = 2
@@ -176,8 +177,6 @@ class Link:
         self.handles = []
         self.threads = []
         self.running = False
-        self.tx_count = 0
-        self.rx_count = 0
 
     @property
     def connected(self):
@@ -198,7 +197,6 @@ class Link:
             raise
         self.handles = opened
         self.running = True
-        self.tx_count = self.rx_count = 0
         for idx in range(len(opened)):
             thread = threading.Thread(target=self._reader, args=(idx,), daemon=True)
             thread.start()
@@ -221,7 +219,6 @@ class Link:
         written = device.write(data)
         if written < 0:
             raise OSError(device.error())
-        self.tx_count += 1
         return written
 
     def close(self):
@@ -605,8 +602,10 @@ class App:
                         (len(payload) >> 8) & 0x0F, len(payload) & 0xFF])
         return header + payload
 
-    def fw_frame_stream(self, packet_seq, data):
-        return bytes([(FW_FRAME_STREAM << 5) | FW_STREAM_ID, self.fw_dest, packet_seq & 0xFF]) + data
+    def fw_frame_stream(self, packet_seq, data, last_of_block=False):
+        # bit 7 of the dest byte: last frame of a 1 KB block
+        dest = self.fw_dest | (FW_STREAM_FLAG_BLOCK_END if last_of_block else 0)
+        return bytes([(FW_FRAME_STREAM << 5) | FW_STREAM_ID, dest, packet_seq & 0xFF]) + data
 
     def request_fw_version(self, dest=FW_DEST_MASTER):
         """GET_PROPERTY(FW version) for the master or the slave. The answer is handled in on_rx."""
@@ -751,7 +750,7 @@ class App:
             self.log("ERR", "FW update: choose a valid file first")
             return
         image = self.fw_image
-        self.fw = {"state": "start", "wait_opcode": FW_OP_START, "block": 0, "blocks": image["blocks"],
+        self.fw = {"state": "start", "wait_opcode": FW_OP_START, "block": 0, "blocks": image["blocks"], "seq": 0,
                    "data": image["data"], "crc": image["crc"], "t0": time.time(),
                    "deadline": time.time() + FW_RESPONSE_TIMEOUT_S}
         self.fw_ctrl_seq = 0
@@ -788,20 +787,25 @@ class App:
             except OSError:
                 pass
 
-    def fw_send_block(self):
+    def fw_block_data(self):
         fw = self.fw
         index = fw["block"]
-        block = fw["data"][index * FW_BLOCK_SIZE:(index + 1) * FW_BLOCK_SIZE]
-        packets = 0
+        return fw["data"][index * FW_BLOCK_SIZE:(index + 1) * FW_BLOCK_SIZE]
+
+    def fw_send_block(self):
+        """Sends the current block in stream packets, the last one has the block-end flag, then waits for the ACK.
+        The last packet of a block is shorter (padded by the HID report), the master cuts it."""
+        fw = self.fw
+        block = self.fw_block_data()
+        packets = (len(block) + FW_PACKET_DATA - 1) // FW_PACKET_DATA
         try:
-            for offset in range(0, len(block), FW_PACKET_DATA):
-                self.fw_write(self.fw_frame_stream(packets, block[offset:offset + FW_PACKET_DATA]))
-                packets += 1
+            for packet in range(packets):
+                offset = packet * FW_PACKET_DATA
+                self.fw_write(self.fw_frame_stream(fw["seq"], block[offset:offset + FW_PACKET_DATA], packet == packets - 1))
+                fw["seq"] += 1
         except OSError as exc:
-            self.fw_fail("write failed in block %d: %s" % (index + 1, exc), send_abort=False)
+            self.fw_fail("write failed in block %d: %s" % (fw["block"] + 1, exc), send_abort=False)
             return
-        self.log("TX", "FW block %d / %d: %d bytes in %d packets, waiting for ACK" % (
-            index + 1, fw["blocks"], len(block), packets))
         fw["state"] = "ack"
         fw["deadline"] = time.time() + FW_ACK_TIMEOUT_S
 
@@ -861,17 +865,17 @@ class App:
             self.log("INFO", "FW: unexpected block ACK ignored (block %d)" % block_index, ts=ts)
             return
         if ack_status != 0:
-            self.log("RX", "FW block %d / %d: ACK ERROR (flash write failed)" % (block_index + 1, fw["blocks"]), ts=ts)
+            self.log("RX", "FW block %d / %d: ACK ERROR" % (block_index + 1, fw["blocks"]), ts=ts)
             self.fw_fail("the device could not write block %d" % (block_index + 1), send_abort=False)
             return
         if block_index != fw["block"]:
             self.fw_fail("ACK for block %d, expected %d" % (block_index, fw["block"]))
             return
         fw["block"] += 1
-        self.log("RX", "FW block %d / %d written (ACK OK)" % (fw["block"], fw["blocks"]), ts=ts)
+        self.log("RX", "FW block %d / %d received (ACK OK)" % (fw["block"], fw["blocks"]), ts=ts)
         self.fw_set_progress(fw["block"], fw["blocks"])
         if fw["block"] < fw["blocks"]:
-            fw["state"] = "send"
+            self.fw_send_block()
             return
         fw["state"] = "verify"
         fw["wait_opcode"] = FW_OP_VERIFY
@@ -903,7 +907,6 @@ class App:
             label = self.link.handles[idx]["label"]
         except IndexError:
             return
-        self.link.rx_count += 1
         if self.fw_on_version_response(data, ts):
             return
         if self.fw_on_rx(data, ts):
@@ -944,11 +947,10 @@ class App:
             self.refresh_devices()
         self.apply_lock(self.link.connected)
         self.drag_splitters()
-        # status + byte counter
+        # status line
         if self.link.connected:
             h0 = self.link.handles[0]["info"]
-            dpg.set_value("status", "Connected: %s (PID %04X)   |   Sent: %d packets   Received: %d packets" % (
-                h0["product"] or "TB device", h0["pid"], self.link.tx_count, self.link.rx_count))
+            dpg.set_value("status", "Connected: %s (PID %04X)" % (h0["product"] or "TB device", h0["pid"]))
             dpg.configure_item("status", color=C_OK)
         else:
             dpg.set_value("status", "Not connected - select a TB device on the left and press Connect")
