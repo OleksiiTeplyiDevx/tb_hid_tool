@@ -52,6 +52,7 @@ FW_PACKET_DATA = 60             # stream packet = 3 byte header + 60 data bytes
 FW_DEST_MASTER = 1              # destination 1 = master, 2 = slave
 FW_DEST_SLAVE = 2
 FW_DEST_NAMES = {FW_DEST_MASTER: "master", FW_DEST_SLAVE: "slave"}
+FW_DEST_BY_NAME = {name: dest for dest, name in FW_DEST_NAMES.items()}   # "master" -> 1, used by "dest" in tb_commands.json
 FW_STREAM_ID = 1
 FW_FRAME_COMMAND = 0
 FW_FRAME_RESPONSE = 1
@@ -94,8 +95,8 @@ CONFIG_ERROR = ""      # not empty when tb_commands.json could not be loaded; sa
 def load_config():
     global CONFIG_ERROR
     try:
-        with open(COMMANDS_FILE, "r", encoding="utf-8") as f:
-            cfg = json.load(f)
+        with open(COMMANDS_FILE, "r", encoding="utf-8") as config_file:
+            cfg = json.load(config_file)
         if not isinstance(cfg.get("protocol"), dict) or not isinstance(cfg.get("commands"), list):
             raise ValueError("sections 'protocol' and 'commands' are required")
         return cfg
@@ -108,8 +109,8 @@ def load_config():
 def save_config(cfg):
     if CONFIG_ERROR:
         return      # do not overwrite a broken file with an empty list
-    with open(COMMANDS_FILE, "w", encoding="utf-8") as f:
-        json.dump(cfg, f, indent=2, ensure_ascii=False)
+    with open(COMMANDS_FILE, "w", encoding="utf-8") as config_file:
+        json.dump(cfg, config_file, indent=2, ensure_ascii=False)
 
 
 # --------------------------------------------------------------------------------------
@@ -118,7 +119,7 @@ def save_config(cfg):
 def parse_hex(text):
     """'02 01 0x0A, 0b' / '0201' -> bytes. Raises ValueError with a readable message."""
     out = bytearray()
-    for tok in (t for t in re.split(r"[\s,;:\-]+", text.strip()) if t):
+    for tok in (token for token in re.split(r"[\s,;:\-]+", text.strip()) if token):
         if tok[:2].lower() == "0x":
             tok = tok[2:]
         if not tok or not re.fullmatch(r"[0-9a-fA-F]+", tok):
@@ -139,15 +140,15 @@ def to_int(text, default=0):
 def hexdump(data, trim_zeros):
     note = ""
     if trim_zeros:
-        n = max(len(data.rstrip(b"\x00")), 1)
-        if n < len(data):
-            note = "   (+%d x 00)" % (len(data) - n)
-            data = data[:n]
+        used_len = max(len(data.rstrip(b"\x00")), 1)
+        if used_len < len(data):
+            note = "   (+%d x 00)" % (len(data) - used_len)
+            data = data[:used_len]
     rows = []
     for off in range(0, len(data), 16):
         chunk = data[off:off + 16]
-        hexs = " ".join("%02X" % b for b in chunk).ljust(47)
-        asc = "".join(chr(b) if 32 <= b < 127 else "." for b in chunk)
+        hexs = " ".join("%02X" % byte_value for byte_value in chunk).ljust(47)
+        asc = "".join(chr(byte_value) if 32 <= byte_value < 127 else "." for byte_value in chunk)
         rows.append("      %04X  %s  |%s|" % (off, hexs, asc))
     if note and rows:
         rows[-1] += note
@@ -159,8 +160,8 @@ def now_str(ts=None):
 
 
 def collection_tag(path):
-    m = re.search(rb"[Cc]ol(\d+)", path or b"")
-    return "Col%s" % m.group(1).decode() if m else "-"
+    match = re.search(rb"[Cc]ol(\d+)", path or b"")
+    return "Col%s" % match.group(1).decode() if match else "-"
 
 
 # --------------------------------------------------------------------------------------
@@ -184,10 +185,10 @@ class Link:
         opened = []
         try:
             for info in infos:
-                h = hid.device()
-                h.open_path(info["path"])
+                device = hid.device()
+                device.open_path(info["path"])
                 label = "%s (usage 0x%04X)" % (collection_tag(info["path"]), info["usage"])
-                opened.append({"h": h, "info": info, "label": label})
+                opened.append({"h": device, "info": info, "label": label})
         except (OSError, ValueError):
             for ent in opened:
                 ent["h"].close()
@@ -196,15 +197,15 @@ class Link:
         self.running = True
         self.tx_count = self.rx_count = 0
         for idx in range(len(opened)):
-            t = threading.Thread(target=self._reader, args=(idx,), daemon=True)
-            t.start()
-            self.threads.append(t)
+            thread = threading.Thread(target=self._reader, args=(idx,), daemon=True)
+            thread.start()
+            self.threads.append(thread)
 
     def _reader(self, idx):
-        h = self.handles[idx]["h"]
+        device = self.handles[idx]["h"]
         while self.running:
             try:
-                data = h.read(MAX_READ, 100)
+                data = device.read(MAX_READ, 100)
             except (OSError, ValueError) as exc:
                 if self.running:
                     self.q.put(("lost", idx, str(exc)))
@@ -213,17 +214,17 @@ class Link:
                 self.q.put(("rx", idx, bytes(data), time.time()))
 
     def write(self, idx, data):
-        h = self.handles[idx]["h"]
-        n = h.write(data)
-        if n < 0:
-            raise OSError(h.error())
+        device = self.handles[idx]["h"]
+        written = device.write(data)
+        if written < 0:
+            raise OSError(device.error())
         self.tx_count += 1
-        return n
+        return written
 
     def close(self):
         self.running = False
-        for t in self.threads:
-            t.join(timeout=0.5)
+        for thread in self.threads:
+            thread.join(timeout=0.5)
         for ent in self.handles:
             try:
                 ent["h"].close()
@@ -235,14 +236,14 @@ class Link:
 
 def enumerate_entries():
     entries = []
-    for d in hid.enumerate(0, 0):
+    for device_info in hid.enumerate(0, 0):
         entries.append({
-            "vid": d["vendor_id"], "pid": d["product_id"],
-            "iface": d["interface_number"],
-            "usage_page": d["usage_page"], "usage": d["usage"],
-            "product": d.get("product_string") or "",
-            "serial": d.get("serial_number") or "",
-            "path": d["path"],
+            "vid": device_info["vendor_id"], "pid": device_info["product_id"],
+            "iface": device_info["interface_number"],
+            "usage_page": device_info["usage_page"], "usage": device_info["usage"],
+            "product": device_info.get("product_string") or "",
+            "serial": device_info.get("serial_number") or "",
+            "path": device_info["path"],
         })
     return entries
 
@@ -289,7 +290,7 @@ class App:
         for ln in lines:
             self.log_text.append(ln)
             item = dpg.add_text(ln, parent="log_win", color=color if ln is header else
-                                tuple(int(c * 0.78) for c in color))
+                                tuple(int(channel * 0.78) for channel in color))
             self.log_items.append(item)
         while len(self.log_items) > MAX_LOG_ITEMS:
             dpg.delete_item(self.log_items.popleft())
@@ -315,8 +316,8 @@ class App:
         os.makedirs(LOG_DIR, exist_ok=True)
         path = os.path.join(LOG_DIR, "tb_hid_log_%s.txt" %
                             datetime.datetime.now().strftime("%Y%m%d_%H%M%S"))
-        with open(path, "w", encoding="utf-8") as f:
-            f.write("\n".join(self.log_text) + "\n")
+        with open(path, "w", encoding="utf-8") as log_file:
+            log_file.write("\n".join(self.log_text) + "\n")
         self.log("INFO", "Log saved: %s" % path)
 
     # ------------------------------------------------------------------ devices
@@ -326,58 +327,58 @@ class App:
         except Exception as exc:
             self.log("ERR", "enumerate failed: %s" % exc)
             return
-        self.all_paths = {e["path"] for e in entries}
+        self.all_paths = {entry["path"] for entry in entries}
 
-        shown = [e for e in entries if is_tb(e)]
-        shown.sort(key=lambda e: (e["pid"], e["iface"], e["path"]))
+        shown = [entry for entry in entries if is_tb(entry)]
+        shown.sort(key=lambda entry: (entry["pid"], entry["iface"], entry["path"]))
         uniq = {}
-        for e in shown:  # one row per physical interface (Windows splits it into Col01/Col02)
-            uniq.setdefault((e["vid"], e["pid"], e["iface"]), e)
+        for entry in shown:  # one row per physical interface (Windows splits it into Col01/Col02)
+            uniq.setdefault((entry["vid"], entry["pid"], entry["iface"]), entry)
         shown = list(uniq.values())
 
-        sig = tuple(e["path"] for e in shown)
+        sig = tuple(entry["path"] for entry in shown)
         if force or sig != self.dev_sig:
             self.dev_sig = sig
             self.dev_map = {}
             items = []
-            for e in shown:
-                s = "%s   PID %04X   interface %s" % (
-                    e["product"] or "TB device", e["pid"], e["iface"])
-                while s in self.dev_map:
-                    s += " "
-                self.dev_map[s] = e
-                items.append(s)
+            for entry in shown:
+                item_text = "%s   PID %04X   interface %s" % (
+                    entry["product"] or "TB device", entry["pid"], entry["iface"])
+                while item_text in self.dev_map:
+                    item_text += " "
+                self.dev_map[item_text] = entry
+                items.append(item_text)
             dpg.configure_item("devlist", items=items)
-            keep = next((s for s, e in self.dev_map.items() if e["path"] == self.selected_path), None)
+            keep = next((item_text for item_text, entry in self.dev_map.items() if entry["path"] == self.selected_path), None)
             if keep is None and items:
                 keep = items[0]
                 self.selected_path = self.dev_map[keep]["path"]
             if keep:
                 dpg.set_value("devlist", keep)
         # connected device disappeared
-        if self.link.connected and not any(h["info"]["path"] in self.all_paths for h in self.link.handles):
+        if self.link.connected and not any(handle["info"]["path"] in self.all_paths for handle in self.link.handles):
             self.log("ERR", "Device removed")
             self.disconnect(manual=False)
         # auto-reconnect
         if (not self.link.connected and self.reconnect_key and dpg.get_value("auto_reconnect")):
             vid, pid, iface, up, usage, open_all = self.reconnect_key
-            cand = [e for e in entries if e["vid"] == vid and e["pid"] == pid and
-                    e["iface"] == iface and e["usage_page"] == up]
+            cand = [entry for entry in entries if entry["vid"] == vid and entry["pid"] == pid and
+                    entry["iface"] == iface and entry["usage_page"] == up]
             if cand:
                 self.connect_entries(cand, open_all, auto=True)
 
     def cb_dev_pick(self, sender, app_data):
-        e = self.dev_map.get(app_data)
-        self.selected_path = e["path"] if e else None
+        entry = self.dev_map.get(app_data)
+        self.selected_path = entry["path"] if entry else None
 
     def connect_entries(self, cand, open_all, auto=False):
         sel = cand[0]
         if open_all and sel["iface"] >= 0:
-            infos = [e for e in cand if e["iface"] == sel["iface"] and e["vid"] == sel["vid"]
-                     and e["pid"] == sel["pid"]]
+            infos = [entry for entry in cand if entry["iface"] == sel["iface"] and entry["vid"] == sel["vid"]
+                     and entry["pid"] == sel["pid"]]
         else:
             infos = [sel]
-        infos.sort(key=lambda e: e["usage"])
+        infos.sort(key=lambda entry: entry["usage"])
         try:
             self.link.open(infos)
         except (OSError, ValueError) as exc:
@@ -388,8 +389,8 @@ class App:
             return False
         self.last_conn_err = ""
         self.reconnect_key = (sel["vid"], sel["pid"], sel["iface"], sel["usage_page"], sel["usage"], open_all)
-        labels = [h["label"] for h in self.link.handles]
-        pref = next((l for l in labels if "0x0001" in l), labels[0])
+        labels = [handle["label"] for handle in self.link.handles]
+        pref = next((label for label in labels if "0x0001" in label), labels[0])
         self.log("INFO", "%sConnected if%s '%s'" % ("Re" if auto else "", sel["iface"], sel["product"]))
         self.request_fw_version(FW_DEST_MASTER)
         self.request_fw_version(FW_DEST_SLAVE)
@@ -398,13 +399,13 @@ class App:
     def cb_connect(self, *_):
         if self.link.connected:
             self.disconnect()
-        sel = next((e for e in self.dev_map.values() if e["path"] == self.selected_path), None)
+        sel = next((entry for entry in self.dev_map.values() if entry["path"] == self.selected_path), None)
         if not sel:
             self.log("ERR", "Select a device in the list first")
             return
-        entries = [e for e in enumerate_entries()
-                   if e["vid"] == sel["vid"] and e["pid"] == sel["pid"]]
-        entries.sort(key=lambda e: e["path"] != sel["path"])  # selected first
+        entries = [entry for entry in enumerate_entries()
+                   if entry["vid"] == sel["vid"] and entry["pid"] == sel["pid"]]
+        entries.sort(key=lambda entry: entry["path"] != sel["path"])  # selected first
         self.connect_entries(entries, True)
 
     def disconnect(self, manual=True):
@@ -430,7 +431,7 @@ class App:
             size = max(to_int(dpg.get_value("pad_size"), 64), 1)
             if len(data) < size:
                 data = data + bytes(size - len(data))
-        labels = [h["label"] for h in self.link.handles]
+        labels = [handle["label"] for handle in self.link.handles]
         order = list(range(len(labels)))
         pref = getattr(self, "write_idx", 0)
         if pref in order:
@@ -470,10 +471,10 @@ class App:
 
     # ------------------------------------------------------------------ frame builder
     def build_frame(self):
-        p = self.cfg["protocol"]
+        protocol = self.cfg["protocol"]
         rid = to_int(dpg.get_value("fb_rid"), 2)
         name = dpg.get_value("fb_op")
-        code = next((to_int(o["code"]) for o in p.get("opcodes", []) if o["name"] == name), None)
+        code = next((to_int(opcode_entry["code"]) for opcode_entry in protocol.get("opcodes", []) if opcode_entry["name"] == name), None)
         if code is None:
             code = to_int(dpg.get_value("fb_op_custom"), 0)
         payload = parse_hex(dpg.get_value("fb_payload"))
@@ -481,7 +482,7 @@ class App:
 
     def cb_fb_changed(self, *_):
         try:
-            dpg.set_value("fb_preview", "Frame: " + " ".join("%02X" % b for b in self.build_frame()))
+            dpg.set_value("fb_preview", "Frame: " + " ".join("%02X" % byte_value for byte_value in self.build_frame()))
         except ValueError as exc:
             dpg.set_value("fb_preview", "Frame: (%s)" % exc)
 
@@ -493,20 +494,20 @@ class App:
 
     def cb_fb_to_raw(self, *_):
         try:
-            dpg.set_value("hex_in", " ".join("%02X" % b for b in self.build_frame()))
+            dpg.set_value("hex_in", " ".join("%02X" % byte_value for byte_value in self.build_frame()))
         except ValueError as exc:
             self.log("ERR", "Payload error: %s" % exc)
 
     def drag_splitters(self):
         if dpg.is_item_active("vsplit"):
-            x = dpg.get_mouse_pos(local=False)[0]
+            mouse_x = dpg.get_mouse_pos(local=False)[0]
             vw = dpg.get_viewport_client_width()
-            dpg.configure_item("left_pane", width=int(max(220, min(x - 14, vw - 420))))
+            dpg.configure_item("left_pane", width=int(max(220, min(mouse_x - 14, vw - 420))))
         if dpg.is_item_active("hsplit"):
-            y = dpg.get_mouse_pos(local=False)[1]
+            mouse_y = dpg.get_mouse_pos(local=False)[1]
             top = dpg.get_item_rect_min("send_panel")[1]
             vh = dpg.get_viewport_client_height()
-            dpg.configure_item("send_panel", height=int(max(120, min(y - top - 3, vh - 200))))
+            dpg.configure_item("send_panel", height=int(max(120, min(mouse_y - top - 3, vh - 200))))
 
     # ------------------------------------------------------------------ UI lock
     def _walk(self, item, out):
@@ -534,42 +535,42 @@ class App:
         self.cmd_sel_ids = []
         self.locked_state = None
         groups = collections.OrderedDict()
-        for i, c in enumerate(self.cfg["commands"]):
-            groups.setdefault(c.get("group", "General"), []).append(i)
-        for g, idxs in groups.items():
-            with dpg.collapsing_header(label=g, default_open=True, parent="cmd_list"):
+        for i, command in enumerate(self.cfg["commands"]):
+            groups.setdefault(command.get("group", "General"), []).append(i)
+        for group, idxs in groups.items():
+            with dpg.collapsing_header(label=group, default_open=True, parent="cmd_list"):
                 for i in idxs:
-                    c = self.cfg["commands"][i]
+                    command = self.cfg["commands"][i]
                     with dpg.group(horizontal=True):
                         dpg.add_button(label="Send", width=46, callback=self.cb_cmd_send, user_data=i)
-                        sid = dpg.add_selectable(label=c["name"], callback=self.cb_cmd_pick, user_data=i)
+                        sid = dpg.add_selectable(label=command["name"], callback=self.cb_cmd_pick, user_data=i)
                         self.cmd_sel_ids.append((i, sid))
                         with dpg.tooltip(sid):
-                            dpg.add_text(c.get("hex", ""), wrap=420)
-                            if c.get("note"):
-                                dpg.add_text(c["note"], color=C_INFO, wrap=420)
+                            dpg.add_text(command.get("hex", ""), wrap=420)
+                            if command.get("note"):
+                                dpg.add_text(command["note"], color=C_INFO, wrap=420)
 
     def cb_cmd_pick(self, sender, app_data, user_data):
         self.cmd_selected = user_data
         for i, sid in self.cmd_sel_ids:
             dpg.set_value(sid, i == user_data)
-        c = self.cfg["commands"][user_data]
-        dpg.set_value("hex_in", c.get("hex", ""))
+        command = self.cfg["commands"][user_data]
+        dpg.set_value("hex_in", command.get("hex", ""))
 
     def cb_cmd_send(self, sender, app_data, user_data):
         self.cb_cmd_pick(sender, app_data, user_data)
-        c = self.cfg["commands"][user_data]
-        if c.get("action") == "fw_version":
-            dest = next((k for k, v in FW_DEST_NAMES.items() if v == c.get("dest", "master")), None)
+        command = self.cfg["commands"][user_data]
+        if command.get("action") == "fw_version":
+            dest = FW_DEST_BY_NAME.get(command.get("dest", "master"))
             if dest is None:
-                self.log("ERR", "Command '%s': unknown dest '%s'" % (c["name"], c.get("dest")))
+                self.log("ERR", "Command '%s': unknown dest '%s'" % (command["name"], command.get("dest")))
                 return
             self.request_fw_version(dest)
             return
         try:
-            self.send_bytes(parse_hex(c.get("hex", "")), c["name"])
+            self.send_bytes(parse_hex(command.get("hex", "")), command["name"])
         except ValueError as exc:
-            self.log("ERR", "Hex error in '%s': %s" % (c["name"], exc))
+            self.log("ERR", "Hex error in '%s': %s" % (command["name"], exc))
 
     def cb_cmd_save(self, *_):
         name = dpg.get_value("save_name").strip()
@@ -583,9 +584,9 @@ class App:
         except ValueError as exc:
             self.log("ERR", "Hex error: %s" % exc)
             return
-        for c in self.cfg["commands"]:
-            if c["name"] == name and c.get("group", "General") == group:
-                c["hex"] = hex_text
+        for command in self.cfg["commands"]:
+            if command["name"] == name and command.get("group", "General") == group:
+                command["hex"] = hex_text
                 break
         else:
             self.cfg["commands"].append({"group": group, "name": name, "hex": hex_text})
@@ -597,11 +598,11 @@ class App:
         if self.cmd_selected is None or self.cmd_selected >= len(self.cfg["commands"]):
             self.log("ERR", "Pick a command in the list to delete")
             return
-        c = self.cfg["commands"].pop(self.cmd_selected)
+        command = self.cfg["commands"].pop(self.cmd_selected)
         self.cmd_selected = None
         save_config(self.cfg)
         self.rebuild_commands()
-        self.log("INFO", "Command '%s' deleted" % c["name"])
+        self.log("INFO", "Command '%s' deleted" % command["name"])
 
     # ------------------------------------------------------------------ firmware update
     def fw_frame_control(self, opcode, payload=b""):
@@ -630,7 +631,7 @@ class App:
         self.version_pending[seq] = dest
         try:
             self.fw_write(frame)
-            self.log("TX", "GET %s FW version  " % name + " ".join("%02X" % b for b in frame))
+            self.log("TX", "GET %s FW version  " % name + " ".join("%02X" % byte_value for byte_value in frame))
         except OSError as exc:
             self.version_pending.pop(seq, None)
             self.log("ERR", "GET %s FW version failed: %s" % (name, exc))
@@ -681,7 +682,7 @@ class App:
         frame = self.fw_frame_control(opcode, payload)
         self.fw_write(frame)
         self.log("TX", "FW %s  %s%s" % (FW_OP_NAMES.get(opcode, "0x%02X" % opcode),
-                                       " ".join("%02X" % b for b in frame), ("  " + note) if note else ""))
+                                       " ".join("%02X" % byte_value for byte_value in frame), ("  " + note) if note else ""))
 
     def fw_set_status(self, text, color=C_INFO):
         dpg.set_value("fw_status", text)
@@ -712,8 +713,8 @@ class App:
             dpg.set_value("fw_info", "No file selected")
             return False
         try:
-            with open(path, "rb") as f:
-                data = f.read()
+            with open(path, "rb") as image_file:
+                data = image_file.read()
         except OSError as exc:
             dpg.set_value("fw_info", "Cannot read file: %s" % exc)
             return False
@@ -914,16 +915,16 @@ class App:
             return
         if self.fw_on_rx(data, ts):
             return
-        p = self.cfg["protocol"]
+        protocol = self.cfg["protocol"]
         rid = data[0]
-        notify = rid == to_int(p.get("report_id_notify", "0x03"), 3)
+        notify = rid == to_int(protocol.get("report_id_notify", "0x03"), 3)
         kind = "NOTIFY" if notify else "RX"
         self.log(kind, "%s  id=0x%02X len=%d" % (label, rid, len(data)),
                  hexdump(data, dpg.get_value("trim")), ts=ts)
-        if self.echo and rid == to_int(p.get("report_id_in", "0x01"), 1):
-            n = len(self.echo["expect"])
-            if data[1:1 + n] == self.echo["expect"]:
-                self.log("OK", "Echo test PASS (%d bytes returned unchanged)" % n)
+        if self.echo and rid == to_int(protocol.get("report_id_in", "0x01"), 1):
+            echo_len = len(self.echo["expect"])
+            if data[1:1 + echo_len] == self.echo["expect"]:
+                self.log("OK", "Echo test PASS (%d bytes returned unchanged)" % echo_len)
             else:
                 self.log("ERR", "Echo test FAIL: reply differs from what was sent")
             self.echo = None
@@ -970,10 +971,10 @@ class App:
             dpg.set_value("status", "Not connected - select a TB device on the left and press Connect")
             dpg.configure_item("status", color=C_ERR)
         try:
-            n = len(parse_hex(dpg.get_value("hex_in")))
+            byte_count = len(parse_hex(dpg.get_value("hex_in")))
             size = to_int(dpg.get_value("pad_size"), 64)
-            pad = " (padded to %d)" % size if dpg.get_value("pad_on") and n < size else ""
-            dpg.set_value("hex_info", "%d byte(s)%s" % (n, pad))
+            pad = " (padded to %d)" % size if dpg.get_value("pad_on") and byte_count < size else ""
+            dpg.set_value("hex_info", "%d byte(s)%s" % (byte_count, pad))
         except ValueError as exc:
             dpg.set_value("hex_info", "invalid hex: %s" % exc)
 
@@ -985,11 +986,11 @@ class App:
             for path, size, which in (("C:/Windows/Fonts/segoeui.ttf", 17, "ui"),
                                       ("C:/Windows/Fonts/consola.ttf", 16, "mono")):
                 if os.path.exists(path):
-                    f = dpg.add_font(path, size)
+                    font = dpg.add_font(path, size)
                     if which == "ui":
-                        dpg.bind_font(f)
+                        dpg.bind_font(font)
                     else:
-                        mono = f
+                        mono = font
 
         with dpg.theme() as global_theme:
             with dpg.theme_component(dpg.mvAll):
@@ -1001,12 +1002,12 @@ class App:
         dpg.bind_theme(global_theme)
 
         def color_theme(rgb):
-            with dpg.theme() as t:
+            with dpg.theme() as theme:
                 with dpg.theme_component(dpg.mvButton):
                     dpg.add_theme_color(dpg.mvThemeCol_Button, rgb)
-                    dpg.add_theme_color(dpg.mvThemeCol_ButtonHovered, tuple(min(255, c + 25) for c in rgb))
-                    dpg.add_theme_color(dpg.mvThemeCol_ButtonActive, tuple(min(255, c + 45) for c in rgb))
-            return t
+                    dpg.add_theme_color(dpg.mvThemeCol_ButtonHovered, tuple(min(255, channel + 25) for channel in rgb))
+                    dpg.add_theme_color(dpg.mvThemeCol_ButtonActive, tuple(min(255, channel + 45) for channel in rgb))
+            return theme
 
         green, red, blue = color_theme((30, 130, 70)), color_theme((150, 50, 50)), color_theme((40, 95, 160))
 
@@ -1016,8 +1017,8 @@ class App:
                 dpg.add_theme_color(dpg.mvThemeCol_ButtonHovered, (90, 130, 190))
                 dpg.add_theme_color(dpg.mvThemeCol_ButtonActive, (90, 130, 190))
                 dpg.add_theme_style(dpg.mvStyleVar_FrameRounding, 2)
-        p = self.cfg["protocol"]
-        op_names = [o["name"] for o in p.get("opcodes", [])] + ["(custom)"]
+        protocol = self.cfg["protocol"]
+        op_names = [opcode_entry["name"] for opcode_entry in protocol.get("opcodes", [])] + ["(custom)"]
 
         with dpg.file_dialog(directory_selector=False, show=False, callback=self.cb_fw_file_picked,
                              tag="fw_file_dialog", width=720, height=420, modal=True):
@@ -1052,7 +1053,7 @@ class App:
                     with dpg.child_window(tag="send_panel", height=270, border=True):
                         with dpg.group(horizontal=True):
                             dpg.add_checkbox(label="Pad with zeros to", tag="pad_on", default_value=True)
-                            dpg.add_input_int(tag="pad_size", default_value=int(p.get("report_size", 64)),
+                            dpg.add_input_int(tag="pad_size", default_value=int(protocol.get("report_size", 64)),
                                               width=110, min_value=1, max_value=512, min_clamped=True)
                             dpg.add_text("bytes")
                         with dpg.tab_bar():
@@ -1077,7 +1078,7 @@ class App:
                                              "(edit opcodes in tb_commands.json)", color=C_NOTIFY)
                                 with dpg.group(horizontal=True):
                                     dpg.add_text("Report ID")
-                                    dpg.add_input_text(tag="fb_rid", width=60, default_value=p.get("report_id_out", "0x02"),
+                                    dpg.add_input_text(tag="fb_rid", width=60, default_value=protocol.get("report_id_out", "0x02"),
                                                        callback=self.cb_fb_changed)
                                     dpg.add_text("Opcode")
                                     dpg.add_combo(items=op_names, tag="fb_op", width=170, default_value=op_names[0],
