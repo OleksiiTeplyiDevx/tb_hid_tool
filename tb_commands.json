@@ -32,7 +32,16 @@
       "name": "Get FW version",
       "hex": "02 00 14 00 02 00 02 00 01",
       "note": "GET_PROPERTY, property 0x0001 = FW version, destination master. The answer is shown above the tabs",
-      "action": "fw_version"
+      "action": "fw_version",
+      "dest": "master"
+    },
+    {
+      "group": "Protocol (placeholder)",
+      "name": "Get slave FW version",
+      "hex": "02 00 08 00 02 00 02 00 01",
+      "action": "fw_version",
+      "dest": "slave",
+      "note": "GET_PROPERTY FW version, destination slave (2). The answer is shown above the tabs"
     }
   ]
 }

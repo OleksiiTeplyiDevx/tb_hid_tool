@@ -49,7 +49,9 @@ REFRESH_PERIOD_S = 1.5
 FW_REPORT_SIZE = 64             # HID report incl. the report ID byte
 FW_BLOCK_SIZE = 4096            # one block = one flash sector, one ACK
 FW_PACKET_DATA = 60             # stream packet = 3 byte header + 60 data bytes
-FW_DEST_MASTER = 1              # destination 1 = master, 2 = slave (not implemented in firmware yet)
+FW_DEST_MASTER = 1              # destination 1 = master, 2 = slave
+FW_DEST_SLAVE = 2
+FW_DEST_NAMES = {FW_DEST_MASTER: "master", FW_DEST_SLAVE: "slave"}
 FW_STREAM_ID = 1
 FW_FRAME_COMMAND = 0
 FW_FRAME_RESPONSE = 1
@@ -84,52 +86,28 @@ C_ERR = (255, 110, 110)
 C_OK = (90, 235, 120)
 
 # --------------------------------------------------------------------------------------
-# Default config. The opcodes are PLACEHOLDERS until the TB protocol spec
-# ("3. Protocol Structure" in Confluence) is wired in - edit them in tb_commands.json.
+# Config: tb_commands.json (lives next to the tool, "protocol" and "commands" are required)
 # --------------------------------------------------------------------------------------
-DEFAULT_CONFIG = {
-    "protocol": {
-        "_comment": "PLACEHOLDER frame layout: [report_id_out][opcode][payload...]. Edit to match the real spec.",
-        "report_id_in": "0x01",
-        "report_id_out": "0x02",
-        "report_id_notify": "0x03",
-        "report_size": 64,
-        "opcodes": [
-            {"name": "SET_PROPERTY", "code": "0x01"},
-            {"name": "GET_PROPERTY", "code": "0x02"},
-            {"name": "NOTIFICATION", "code": "0x03"},
-        ],
-    },
-    "commands": [
-        {"group": "Link test", "name": "Echo 01..3F (63 B)",
-         "hex": " ".join("%02X" % b for b in [0x02] + list(range(1, 64))),
-         "note": "Firmware loopback: OUT 0x02 -> IN 0x01 with the same payload"},
-        {"group": "Link test", "name": "Echo short (4 B)", "hex": "02 AA BB CC DD",
-         "note": "Short echo, padded with zeros up to the report size"},
-        {"group": "Protocol (placeholder)", "name": "Get FW version", "hex": "02 00 14 00 02 00 02 00 01", "action": "fw_version",
-         "note": "GET_PROPERTY, property 0x0001 = FW version, destination master. The answer is shown above the tabs"},
-        {"group": "Protocol (placeholder)", "name": "Set property 0x0001 = 1", "hex": "02 01 01 00 01",
-         "note": "PLACEHOLDER - SET_PROPERTY, property id 0x0001, value 1"},
-    ],
-}
+CONFIG_ERROR = ""      # not empty when tb_commands.json could not be loaded; saving is blocked then
 
 
 def load_config():
-    if not os.path.exists(COMMANDS_FILE):
-        save_config(DEFAULT_CONFIG)
-        return json.loads(json.dumps(DEFAULT_CONFIG))
+    global CONFIG_ERROR
     try:
         with open(COMMANDS_FILE, "r", encoding="utf-8") as f:
             cfg = json.load(f)
-        cfg.setdefault("protocol", DEFAULT_CONFIG["protocol"])
-        cfg.setdefault("commands", [])
+        if not isinstance(cfg.get("protocol"), dict) or not isinstance(cfg.get("commands"), list):
+            raise ValueError("sections 'protocol' and 'commands' are required")
         return cfg
     except (OSError, ValueError) as exc:
-        print("Cannot read %s (%s), using defaults" % (COMMANDS_FILE, exc))
-        return json.loads(json.dumps(DEFAULT_CONFIG))
+        CONFIG_ERROR = "Cannot load %s: %s. Started with an empty command list." % (COMMANDS_FILE, exc)
+        print(CONFIG_ERROR)
+        return {"protocol": {}, "commands": []}
 
 
 def save_config(cfg):
+    if CONFIG_ERROR:
+        return      # do not overwrite a broken file with an empty list
     with open(COMMANDS_FILE, "w", encoding="utf-8") as f:
         json.dump(cfg, f, indent=2, ensure_ascii=False)
 
@@ -297,6 +275,8 @@ class App:
         self.fw = None             # running firmware update (dict) or None
         self.fw_image = None       # loaded file (dict) or None
         self.fw_ctrl_seq = 0
+        self.fw_dest = FW_DEST_MASTER
+        self.version_pending = {}   # control seq -> destination
 
     # ------------------------------------------------------------------ logging
     def log(self, kind, text, extra=None, ts=None):
@@ -411,7 +391,8 @@ class App:
         labels = [h["label"] for h in self.link.handles]
         pref = next((l for l in labels if "0x0001" in l), labels[0])
         self.log("INFO", "%sConnected if%s '%s'" % ("Re" if auto else "", sel["iface"], sel["product"]))
-        self.request_fw_version()
+        self.request_fw_version(FW_DEST_MASTER)
+        self.request_fw_version(FW_DEST_SLAVE)
         return True
 
     def cb_connect(self, *_):
@@ -579,7 +560,11 @@ class App:
         self.cb_cmd_pick(sender, app_data, user_data)
         c = self.cfg["commands"][user_data]
         if c.get("action") == "fw_version":
-            self.request_fw_version()
+            dest = next((k for k, v in FW_DEST_NAMES.items() if v == c.get("dest", "master")), None)
+            if dest is None:
+                self.log("ERR", "Command '%s': unknown dest '%s'" % (c["name"], c.get("dest")))
+                return
+            self.request_fw_version(dest)
             return
         try:
             self.send_bytes(parse_hex(c.get("hex", "")), c["name"])
@@ -622,49 +607,54 @@ class App:
     def fw_frame_control(self, opcode, payload=b""):
         seq = self.fw_ctrl_seq & 0x0F
         self.fw_ctrl_seq = (self.fw_ctrl_seq + 1) & 0x0F
-        header = bytes([FW_FRAME_COMMAND << 5, (seq << 4) | (FW_DEST_MASTER << 2), 0, opcode,
+        header = bytes([FW_FRAME_COMMAND << 5, (seq << 4) | (self.fw_dest << 2), 0, opcode,
                         (len(payload) >> 8) & 0x0F, len(payload) & 0xFF])
         return header + payload
 
     def fw_frame_stream(self, packet_seq, data):
-        return bytes([(FW_FRAME_STREAM << 5) | FW_STREAM_ID, FW_DEST_MASTER, packet_seq & 0xFF]) + data
+        return bytes([(FW_FRAME_STREAM << 5) | FW_STREAM_ID, self.fw_dest, packet_seq & 0xFF]) + data
 
-    def request_fw_version(self):
-        """GET_PROPERTY(FW version). The answer is handled in on_rx."""
+    def request_fw_version(self, dest=FW_DEST_MASTER):
+        """GET_PROPERTY(FW version) for the master or the slave. The answer is handled in on_rx."""
         if not self.link.connected:
             self.log("ERR", "Not connected")
             return
-        dpg.set_value("fw_version", "Device FW version: reading...")
-        self.version_seq = self.fw_ctrl_seq & 0x0F
+        tag = "fw_version" if dest == FW_DEST_MASTER else "fw_version_slave"
+        name = FW_DEST_NAMES[dest].capitalize()
+        dpg.set_value(tag, "%s FW version: reading..." % name)
+        seq = self.fw_ctrl_seq & 0x0F
         self.fw_ctrl_seq = (self.fw_ctrl_seq + 1) & 0x0F
         payload = PROP_FW_VERSION.to_bytes(2, "big")
-        frame = bytes([FW_FRAME_COMMAND << 5, (self.version_seq << 4) | (FW_DEST_MASTER << 2), 0, OP_GET_PROPERTY,
+        frame = bytes([FW_FRAME_COMMAND << 5, (seq << 4) | (dest << 2), 0, OP_GET_PROPERTY,
                        0, len(payload)]) + payload
-        self.version_pending = True
+        self.version_pending[seq] = dest
         try:
             self.fw_write(frame)
-            self.log("TX", "GET FW version  " + " ".join("%02X" % b for b in frame))
+            self.log("TX", "GET %s FW version  " % name + " ".join("%02X" % b for b in frame))
         except OSError as exc:
-            self.version_pending = False
-            self.log("ERR", "GET FW version failed: %s" % exc)
+            self.version_pending.pop(seq, None)
+            self.log("ERR", "GET %s FW version failed: %s" % (name, exc))
 
     def fw_on_version_response(self, data, ts):
-        """Returns True when the report is the answer to GET FW version."""
-        if not getattr(self, "version_pending", False) or len(data) < 8:
+        """Returns True when the report is the answer to GET FW version (matched by sequence number)."""
+        if not self.version_pending or len(data) < 8:
             return False
         frame = data[1:]
-        if (frame[0] >> 5) != FW_FRAME_RESPONSE or frame[3] != OP_GET_PROPERTY:
+        seq = frame[1] >> 4
+        if (frame[0] >> 5) != FW_FRAME_RESPONSE or frame[3] != OP_GET_PROPERTY or seq not in self.version_pending:
             return False
-        self.version_pending = False
+        dest = self.version_pending.pop(seq)
+        name = FW_DEST_NAMES[dest].capitalize()
+        tag = "fw_version" if dest == FW_DEST_MASTER else "fw_version_slave"
         length = ((frame[4] & 0x0F) << 8) | frame[5]
         status = frame[6] if length >= 1 else 0xFF
         if status != 0:
-            self.log("ERR", "GET FW version: device status %d" % status, ts=ts)
-            dpg.set_value("fw_version", "Device FW version: unknown (status %d)" % status)
+            self.log("ERR", "GET %s FW version: device status %d" % (name, status), ts=ts)
+            dpg.set_value(tag, "%s FW version: unknown (status %d)" % (name, status))
             return True
         version = bytes(frame[7:6 + length]).decode("ascii", errors="replace")
-        self.log("OK", "Device FW version: %s" % version, ts=ts)
-        dpg.set_value("fw_version", "Device FW version: %s" % version)
+        self.log("OK", "%s FW version: %s" % (name, version), ts=ts)
+        dpg.set_value(tag, "%s FW version: %s" % (name, version))
         return True
 
     def fw_write(self, frame):
@@ -737,8 +727,12 @@ class App:
             os.path.basename(path), len(data), blocks, FW_BLOCK_SIZE, crc))
         return True
 
+    def cb_fw_dest(self, *_):
+        self.fw_dest = FW_DEST_SLAVE if dpg.get_value("fw_dest_sel") == "Slave" else FW_DEST_MASTER
+        self.fw_set_default_file()
+
     def fw_set_default_file(self):
-        guess = os.path.normpath(os.path.join(APP_DIR, "..", "master", "fota_package.bin"))
+        guess = os.path.normpath(os.path.join(APP_DIR, "..", FW_DEST_NAMES[self.fw_dest], "fota_package.bin"))
         if os.path.exists(guess):
             dpg.set_value("fw_path", guess)
             self.fw_load_file(guess)
@@ -767,8 +761,11 @@ class App:
                    "data": image["data"], "crc": image["crc"], "t0": time.time(),
                    "deadline": time.time() + FW_RESPONSE_TIMEOUT_S}
         self.fw_ctrl_seq = 0
-        self.log("INFO", "FW update: %s, %d bytes, %d blocks, CRC32 0x%08X, destination master" % (
-            os.path.basename(image["path"]), len(image["data"]), image["blocks"], image["crc"]))
+        self.version_pending.clear()
+        dpg.configure_item("fw_dest_sel", enabled=False)
+        self.log("INFO", "FW update: %s, %d bytes, %d blocks, CRC32 0x%08X, destination %s" % (
+            os.path.basename(image["path"]), len(image["data"]), image["blocks"], image["crc"],
+            FW_DEST_NAMES[self.fw_dest]))
         self.fw_set_progress(0, image["blocks"], "Starting...")
         self.fw_set_status("Update running", C_NOTIFY)
         payload = len(image["data"]).to_bytes(4, "little") + image["crc"].to_bytes(4, "little")
@@ -947,6 +944,8 @@ class App:
             elif ev[0] == "lost":
                 self.on_lost(ev)
         self.fw_tick()
+        if dpg.does_item_exist("fw_dest_sel"):
+            dpg.configure_item("fw_dest_sel", enabled=not self.fw)
         if self.fw:
             self.fw_refresh_progress()
         now = time.time()
@@ -1048,7 +1047,8 @@ class App:
                 # -------- right: status, send, log
                 with dpg.child_window(width=-1, border=False):
                     dpg.add_text("Not connected", tag="status")
-                    dpg.add_text("Device FW version: -", tag="fw_version", color=C_NOTIFY)
+                    dpg.add_text("Master FW version: -", tag="fw_version", color=C_NOTIFY)
+                    dpg.add_text("Slave FW version: -", tag="fw_version_slave", color=C_NOTIFY)
                     with dpg.child_window(tag="send_panel", height=270, border=True):
                         with dpg.group(horizontal=True):
                             dpg.add_checkbox(label="Pad with zeros to", tag="pad_on", default_value=True)
@@ -1093,12 +1093,15 @@ class App:
                                     dpg.add_button(label="Copy to Raw hex", callback=self.cb_fb_to_raw)
                             with dpg.tab(label="Firmware update"):
                                 with dpg.group(horizontal=True):
+                                    dpg.add_text("Target chip:")
+                                    dpg.add_radio_button(items=["Master", "Slave"], tag="fw_dest_sel", horizontal=True,
+                                                         default_value="Master", callback=self.cb_fw_dest)
+                                with dpg.group(horizontal=True):
                                     dpg.add_input_text(tag="fw_path", width=-110, hint="path to fota_package.bin",
                                                        on_enter=True, callback=self.cb_fw_path)
                                     dpg.add_button(label="Browse...", width=100,
                                                    callback=lambda *_: dpg.show_item("fw_file_dialog"))
                                 dpg.add_text("No file selected", tag="fw_info", color=C_INFO)
-                                dpg.add_button(label="Read FW version", width=150, callback=lambda *_: self.request_fw_version())
                                 with dpg.group(horizontal=True):
                                     fw_start = dpg.add_button(label="Start update", width=130, callback=self.cb_fw_start)
                                     dpg.bind_item_theme(fw_start, green)
@@ -1129,6 +1132,8 @@ class App:
         dpg.set_primary_window("main", True)
         dpg.show_viewport()
         self.log("INFO", "%s ready. Only Turtle Beach devices with the TB protocol interface (usage page 0xFF42) are listed." % APP_TITLE)
+        if CONFIG_ERROR:
+            self.log("ERR", CONFIG_ERROR)
 
     def demo_log(self):
         self.log("INFO", "--- demo lines, not from a device ---")
