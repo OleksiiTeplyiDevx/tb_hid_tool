@@ -3,3 +3,7 @@ __pycache__/
 logs/
 out.png
 *.pyc
+build_number.py 
+build/ 
+dist/ 
+*.spec 

@@ -1,0 +1,41 @@
+name: build
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # full history: build number = commit count
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install
+        run: pip install -r requirements.txt pyinstaller
+
+      - name: Build number
+        shell: bash
+        run: echo "BUILD_NUMBER = $(git rev-list --count HEAD)" > build_number.py
+
+      - name: Version
+        id: ver
+        shell: bash
+        run: echo "version=$(python -c 'import tb_hid_tool as t;print(t.APP_VERSION)')" >> "$GITHUB_OUTPUT"
+
+      - name: PyInstaller
+        run: pyinstaller --noconfirm --clean --onedir --windowed --name TBHidTool tb_hid_tool.py
+
+      - name: Package
+        shell: bash
+        run: cp tb_commands.json dist/TBHidTool/
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: TBHidTool_${{ steps.ver.outputs.version }}
+          path: dist/TBHidTool
